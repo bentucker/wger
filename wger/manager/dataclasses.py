@@ -272,9 +272,11 @@ def round_value(
 @dataclass(init=False)
 class ConfigRequirements:
     rules: List[str] = field(default_factory=list)
+    all_sets: bool = False
 
     def __init__(self, data: Dict[str, Any]):
         self.rules = data.get('rules', [])
+        self.all_sets = bool(data.get('all_sets', False))
 
     def __bool__(self):
         return bool(self.rules)

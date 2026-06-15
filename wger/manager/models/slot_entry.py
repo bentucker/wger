@@ -39,6 +39,7 @@ from wger.core.models import (
 from wger.exercises.models import Exercise
 from wger.manager.consts import (
     REP_UNIT_REPETITIONS,
+    REQUIREMENT_RULES,
     WEIGHT_UNIT_KG,
 )
 from wger.manager.dataclasses import (
@@ -90,6 +91,40 @@ class ExerciseType(models.TextChoices):
 
 
 logger = logging.getLogger(__name__)
+
+
+# `load_all_configs()` field keys and the `max_iterations` pointer dict use the same
+# (no-underscore) names, so advancement sites write straight through `field`.
+
+# Process-level guard so the "unknown requirement rule" warning is emitted at most once
+# per (slot_entry_id, rule_key). This branch is unreachable in normal operation (the
+# serializer validator gates the keys), but it becomes reachable in bulk after a feature
+# rollback when stored `max_*` rules turn into unknown keys; throttling keeps it a useful
+# canary without flooding the logs. The guard is bounded so a long-lived worker on a large
+# instance can't accumulate unbounded tuples: once it reaches the cap it stops growing and
+# (conservatively) lets warnings through again, which is acceptable for a defensive canary.
+_unknown_rule_logged: set = set()
+_UNKNOWN_RULE_LOG_CAP = 1024
+
+
+def _log_unknown_rule_once(slot_entry_id, rule_key: str) -> None:
+    # Unsaved entries all share `id=None`; don't pollute (or dedupe through) the shared
+    # guard for them, just warn directly so the canary still fires.
+    if slot_entry_id is None:
+        logger.warning(
+            f'Unknown requirement rule {rule_key!r} on an unsaved SlotEntry; ignoring.',
+        )
+        return
+
+    guard_key = (slot_entry_id, rule_key)
+    if guard_key in _unknown_rule_logged:
+        return
+    # Bound the guard: stop caching new keys once the cap is reached.
+    if len(_unknown_rule_logged) < _UNKNOWN_RULE_LOG_CAP:
+        _unknown_rule_logged.add(guard_key)
+    logger.warning(
+        f'Unknown requirement rule {rule_key!r} on SlotEntry {slot_entry_id}; ignoring.',
+    )
 
 
 class SlotEntry(models.Model):
@@ -411,14 +446,21 @@ class SlotEntry(models.Model):
             'maxsets': 1,
         }
 
-        def _requirement_met(log: WorkoutLog, field_name: str) -> bool:
-            """Checks if the requirements for a single field are met for this log"""
+        def _requirement_met(log: WorkoutLog, rule_key: str) -> bool:
+            """Checks if this log satisfies the named requirement rule"""
 
-            log_value = getattr(log, field_name, None)
+            # Normally the validator guarantees the key exists, but `model.save()`
+            # bypasses it, so an unknown rule can be persisted. Treat it as unmet
+            # (safe-hold) instead of raising; the threshold loop logs it once.
+            rule = REQUIREMENT_RULES.get(rule_key)
+            if rule is None:
+                return False
+
+            log_value = getattr(log, rule.log_field, None)
             if log_value is None:
                 return False
 
-            min_value = min_values.get(field_name)
+            min_value = min_values.get(rule_key)
             if min_value is None:
                 return False
 
@@ -441,38 +483,107 @@ class SlotEntry(models.Model):
                     max_iterations[field] = i
                     continue
 
-                # Precompute threshold values for all required fields once per iteration
+                # Precompute threshold values for all required rules once per iteration
                 # to avoid recalculating them for every log entry.
                 min_values: Dict[str, Decimal | None] = {}
-                for req_field in requirements.rules:
+                for rule_key in requirements.rules:
+                    rule = REQUIREMENT_RULES.get(rule_key)
+                    if rule is None:
+                        # Defence-in-depth: the validator already gates the keys, so this
+                        # only fires in bulk after a feature rollback. Throttled warning.
+                        _log_unknown_rule_once(self.id, rule_key)
+                        min_values[rule_key] = None
+                        continue
+
                     calc_fn: Callable[[int], Decimal | None] | None = getattr(
-                        self, f'calculate_{req_field}', None
+                        self, rule.threshold_method, None
                     )
                     if not callable(calc_fn):
                         logger.error(
-                            f'Missing method calculate_{req_field} on SlotEntry {self.id}',
+                            f'Missing method {rule.threshold_method} on SlotEntry {self.id}',
                         )
-                        min_values[req_field] = None
+                        min_values[rule_key] = None
                         continue
 
                     try:
-                        min_values[req_field] = calc_fn(max_iterations[req_field])
+                        min_values[rule_key] = calc_fn(max_iterations[rule.iteration_key])
                     except Exception as e:
                         logger.error(
-                            f'Error during calculate_{req_field} for SlotEntry {self.id}: {e}',
+                            f'Error during {rule.threshold_method} for SlotEntry {self.id}: {e}',
                         )
-                        min_values[req_field] = None
+                        min_values[rule_key] = None
 
                 # Field has requirements, check if they are met
                 # logger.debug(f'Requirements for {field} in iteration {i}: {requirements.rules}')
-                for log in log_data:
-                    # If any log satisfies all required fields for the config, the field is ready
-                    all_fields_met = all(
-                        _requirement_met(log, req_field) for req_field in requirements.rules
-                    )
-                    if all_fields_met:
-                        max_iterations[field] = i
-                        break
+                if requirements.all_sets:
+                    # Strict double progression ("all N prescribed sets at the top"):
+                    #   (1) the lifter logged at least the prescribed number of sets for the
+                    #       prior iteration, AND
+                    #   (2) every logged set for this slot entry met all rules.
+                    # The set count comes from `calculate_sets(i - 1)` (the *prescribed* count
+                    # for the iteration the logs belong to). Per the design's Edge cases §1
+                    # this deliberately uses the *ungated* prescribed count via the loop index
+                    # `i - 1` rather than the progression-gated `max_iterations['sets']`
+                    # pointer: they are identical for a static sets count (every realistic
+                    # case) and the loop-index form is the accepted fail-safe approximation
+                    # for the exotic gated-progressing-sets combination.
+                    #
+                    # The threshold is floored at 1 (covering both `None` from no SetsConfig
+                    # and a degenerate <= 0 prescription) so the `len(log_data) >=
+                    # prescribed_sets` clause keeps subsuming the empty-log guard and the
+                    # vacuous `all([])` trap, which both rely on `prescribed_sets >= 1`.
+                    prescribed_sets = self.calculate_sets(i - 1)
+                    if prescribed_sets is None or prescribed_sets < 1:
+                        prescribed_sets = 1
+                    if len(log_data) >= prescribed_sets and all(
+                        all(_requirement_met(log, rule_key) for rule_key in requirements.rules)
+                        for log in log_data
+                    ):
+                        # Gated progression: advance by exactly ONE earned increment per
+                        # qualifying iteration instead of jumping to the calendar index `i`
+                        # (which would back-fill increments for skipped iterations).
+                        #
+                        # Pointer semantics (IMPORTANT — canonical-shape assumption):
+                        # in the ungated branch above, `max_iterations[field]` is a
+                        # *calendar iteration index* (`= i`); in these gated branches it
+                        # becomes an *earned-step count* (`+= 1`). The same integer is
+                        # later fed to `calculate_X(n)`, which walks the config chain by
+                        # iteration index. The two readings coincide for the canonical
+                        # shape the double-progression UI flow produces for a gated field:
+                        # a base config at iteration 1 plus a single repeating gated
+                        # `+increment` at iteration 2 (so
+                        # `calculate_X(count) == base + (count-1)*increment`, and the init
+                        # value of 1 stands in for the base — no separate ungated seed is
+                        # required, covering a gated config that already carries
+                        # `requirements` at iteration 1).
+                        #
+                        # Note the validators only check the `requirements` dict, not the
+                        # config-iteration topology, so other shapes can still be persisted
+                        # (the pin test below builds one). Mixing calendar-scheduled later
+                        # configs with gated progression on the SAME field is therefore
+                        # unsupported and out of scope here:
+                        #   - an ungated higher-iteration config (e.g. a `replace`/deload at
+                        #     iteration N) snaps the counter forward via the `= i` branch;
+                        #   - a second gated `+increment` at iteration N applies after that
+                        #     many *earned* steps rather than at its calendar iteration.
+                        # See test_gated_mixed_with_later_ungated_replace_is_pinned for the
+                        # pinned behaviour. Fully decoupling the earned-step counter from the
+                        # calendar selection pointer is a larger refactor and deliberately
+                        # deferred.
+                        max_iterations[field] += 1
+                else:
+                    for log in log_data:
+                        # If any log satisfies all rules for the config, the field is ready
+                        all_fields_met = all(
+                            _requirement_met(log, rule_key) for rule_key in requirements.rules
+                        )
+                        if all_fields_met:
+                            # Gated progression: advance by exactly ONE earned increment per
+                            # qualifying iteration (see the canonical-shape note on the
+                            # all_sets branch above for the pointer semantics). The `break`
+                            # keeps this to at most one earned step per iteration.
+                            max_iterations[field] += 1
+                            break
 
         sets = self.calculate_sets(max_iterations['sets'])
         max_sets = self.calculate_maxsets(max_iterations['maxsets'])

@@ -42,6 +42,20 @@ class ChangeConfigTestCase(WgerTestCase):
             ConfigRequirements(data={'rules': ['weight', 'repetitions']}),
         )
 
+    def test_requirements_all_sets_default_false(self):
+        """``all_sets`` defaults to False when not present in the requirements"""
+
+        requirements = ConfigRequirements(data={'rules': ['max_repetitions']})
+
+        self.assertFalse(requirements.all_sets)
+
+    def test_requirements_all_sets_parsed(self):
+        """``all_sets`` is parsed as a boolean from the requirements dict"""
+
+        requirements = ConfigRequirements(data={'rules': ['max_repetitions'], 'all_sets': True})
+
+        self.assertTrue(requirements.all_sets)
+
     def test_bool_false(self):
         """
         Test the __bool__ method in ConfigRequirements
